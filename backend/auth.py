@@ -55,6 +55,12 @@ def require_writer(user: dict[str, Any]) -> None:
         raise HTTPException(403, detail="只读账号不可写")
 
 
+def session_owner_token(authorization: str | None) -> str:
+    """把登录态 Bearer token 压成锁属主标识：同名用户的不同会话也互不重入。"""
+    raw = (authorization or "").strip()
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32] if raw else "anonymous"
+
+
 @router.get("/me")
 def me(authorization: str | None = Header(default=None)):
     return current_user(authorization)

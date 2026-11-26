@@ -23,10 +23,37 @@ PRODUCT_META = {
 
 def connect() -> sqlite3.Connection:
     DATA.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=30000")
     return conn
+
+
+def _ensure_columns(conn: sqlite3.Connection) -> None:
+    """对已存在的旧库做幂等加列（CREATE TABLE IF NOT EXISTS 不会改旧表）。"""
+    wanted = {
+        "release_shadows": {
+            "voided_at": "REAL",
+            "void_reason": "TEXT NOT NULL DEFAULT ''",
+            "voided_by": "TEXT NOT NULL DEFAULT ''",
+        },
+        "rule_shadows": {
+            "voided_at": "REAL",
+            "void_reason": "TEXT NOT NULL DEFAULT ''",
+            "voided_by": "TEXT NOT NULL DEFAULT ''",
+        },
+        "row_locks": {
+            "owner_token": "TEXT NOT NULL DEFAULT ''",
+        },
+    }
+    for table, cols in wanted.items():
+        existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if not existing:
+            continue
+        for name, decl in cols.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
 
 SCHEMA = """
@@ -79,7 +106,10 @@ CREATE TABLE IF NOT EXISTS rule_shadows(
   cohort_id INTEGER REFERENCES cohorts(id),
   status TEXT NOT NULL,
   created_at REAL NOT NULL,
-  created_by TEXT NOT NULL
+  created_by TEXT NOT NULL,
+  voided_at REAL,
+  void_reason TEXT NOT NULL DEFAULT '',
+  voided_by TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS releases(
   id INTEGER PRIMARY KEY,
@@ -102,7 +132,10 @@ CREATE TABLE IF NOT EXISTS release_shadows(
   cohort_id INTEGER REFERENCES cohorts(id),
   status TEXT NOT NULL,
   created_at REAL NOT NULL,
-  created_by TEXT NOT NULL
+  created_by TEXT NOT NULL,
+  voided_at REAL,
+  void_reason TEXT NOT NULL DEFAULT '',
+  voided_by TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS kill_events(
   id INTEGER PRIMARY KEY,
@@ -154,6 +187,7 @@ CREATE TABLE IF NOT EXISTS audit_log(
 CREATE TABLE IF NOT EXISTS row_locks(
   lock_key TEXT PRIMARY KEY,
   holder TEXT NOT NULL,
+  owner_token TEXT NOT NULL DEFAULT '',
   expires_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS contention_marks(
@@ -282,5 +316,6 @@ def seed(conn: sqlite3.Connection) -> None:
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        _ensure_columns(conn)
         seed(conn)
         conn.commit()

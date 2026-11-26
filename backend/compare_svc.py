@@ -5,6 +5,8 @@ from fastapi import APIRouter, Header, HTTPException
 
 from auth import current_user
 from db import connect
+from policies import SHADOW_VOID_STATUSES
+from releases_svc import annotate_shadow, void_overdue_release_shadows
 from validators import require_int
 
 router = APIRouter(prefix="/api/compare", tags=["compare"])
@@ -15,11 +17,16 @@ def compare_flag_env(flag_id: int, env_id: int, authorization: str | None = Head
     current_user(authorization)
     fid = require_int(flag_id, "开关", 1)
     eid = require_int(env_id, "环境", 1)
+    void_statuses = tuple(SHADOW_VOID_STATUSES)
     with connect() as conn:
         fl = conn.execute("SELECT id, key, title, status FROM flags WHERE id=?", (fid,)).fetchone()
         env = conn.execute("SELECT id, code, title FROM environments WHERE id=?", (eid,)).fetchone()
         if not fl or not env:
             raise HTTPException(404, detail="开关或环境不存在")
+        # 对比页读取前先按甲路径把超龄 open 影子同事务作废，作废草稿不再算“齐套待升正”。
+        voided_ids = void_overdue_release_shadows(conn, actor="system:auto")
+        if voided_ids:
+            conn.commit()
         official = conn.execute(
             "SELECT * FROM flag_rules WHERE flag_id=? AND env_id=? AND official=1", (fid, eid)
         ).fetchone()
@@ -31,10 +38,18 @@ def compare_flag_env(flag_id: int, env_id: int, authorization: str | None = Head
             ).fetchall()
         ]
         release_shadows = [
-            dict(r)
+            annotate_shadow(r)
             for r in conn.execute(
                 "SELECT * FROM release_shadows WHERE flag_id=? AND env_id=? AND status='open' ORDER BY id DESC",
                 (fid, eid),
+            ).fetchall()
+        ]
+        void_release_shadows = [
+            annotate_shadow(r)
+            for r in conn.execute(
+                "SELECT * FROM release_shadows WHERE flag_id=? AND env_id=? "
+                f"AND status IN ({','.join('?' for _ in void_statuses)}) ORDER BY id DESC LIMIT 20",
+                (fid, eid, *void_statuses),
             ).fetchall()
         ]
         kill_shadows = [
@@ -57,16 +72,22 @@ def compare_flag_env(flag_id: int, env_id: int, authorization: str | None = Head
         for field in ("kind", "percent", "cohort_id"):
             if official[field] != sh.get(field):
                 diffs.append({"field": field, "official": official[field], "shadow": sh.get(field)})
+    # “草稿齐套”只认真正 open 且未超龄、可升正的影子；已作废的不计入。
+    actionable_release = [s for s in release_shadows if s.get("actionable", True)]
+    draft_ready = bool(actionable_release or rule_shadows or kill_shadows)
     return {
         "flag": dict(fl),
         "env": dict(env),
         "official_rule": dict(official) if official else None,
         "open_rule_shadows": rule_shadows,
         "open_release_shadows": release_shadows,
+        "void_release_shadows": void_release_shadows,
         "open_kill_shadows": kill_shadows,
         "recent_releases": recent_releases,
         "diffs": diffs,
-        "has_pending_shadow": bool(rule_shadows or release_shadows or kill_shadows),
+        "draft_ready": draft_ready,
+        "voided_on_read": voided_ids,
+        "has_pending_shadow": draft_ready,
     }
 
 
